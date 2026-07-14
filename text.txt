@@ -1,0 +1,7 @@
+osint-bot/
+├── bot.py
+├── requirements.txt
+├── Dockerfile
+├── .env.example
+├── supabase.sql
+└── README.md
