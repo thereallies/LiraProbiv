@@ -421,7 +421,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
     await update.message.reply_text(
-        f"🤖 **OSINT-MAX Bot**\n\n"
+        f"🤖 **LIRAMAX Bot**\n\n"
         f"Привет, {user.first_name}! Я помогаю находить информацию в открытых источниках.\n"
         f"У вас **3 бесплатных запроса**, затем нужна подписка.\n\n"
         f"Выберите действие:",
