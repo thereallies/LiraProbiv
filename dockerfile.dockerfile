@@ -11,6 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Исправлено: копируем все файлы из текущей папки в /app
 COPY . .
 
 CMD ["python", "bot.py"]
