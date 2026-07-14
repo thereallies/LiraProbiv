@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional, Dict, List
 import requests
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
@@ -406,7 +406,9 @@ def format_search_result(search_type: str, target: str, raw_data: Dict, has_subs
     return message
 
 # --------------------- ОБРАБОТЧИКИ БОТА ---------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+    """Показывает главное меню, может редактировать существующее сообщение"""
     user = update.effective_user
     ensure_user_exists(user.id, username=user.username, first_name=user.first_name)
     keyboard = [
@@ -420,19 +422,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💳 Подписка / Баланс", callback_data='subscription'),
          InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
-    await update.message.reply_text(
-        f"🤖 **LIRAMAX Bot**\n\n"
-        f"Привет, {user.first_name}! Я помогаю находить информацию в открытых источниках.\n"
-        f"У вас **3 бесплатных запроса**, затем нужна подписка.\n\n"
-        f"Выберите действие:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
+    text = (f"🤖 **OSINT-MAX Bot**\n\n"
+            f"Привет, {user.first_name}! Я помогаю находить информацию в открытых источниках.\n"
+            f"У вас **3 бесплатных запроса**, затем нужна подписка.\n\n"
+            f"Выберите действие:")
+    if edit:
+        await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+# Команда /start теперь вызывает show_main_menu с edit=False
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_main_menu(update, context, edit=False)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
     if data == 'help':
         await query.edit_message_text(
             "📖 **Помощь**\n\n"
@@ -449,7 +456,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад в меню", callback_data='back_to_main')]])
         )
     elif data == 'back_to_main':
-        await start(update, context)
+        await show_main_menu(update, context, edit=True)
     elif data == 'subscription':
         await show_subscription_menu(update, context)
     elif data.startswith('buy_plan_'):
@@ -579,10 +586,11 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def show_subscription_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     user_id = update.effective_user.id
     user_info = get_user_info(user_id)
     if not user_info:
-        await update.callback_query.edit_message_text("❌ Ошибка: пользователь не найден")
+        await query.edit_message_text("❌ Ошибка: пользователь не найден")
         return
     balance = user_info.get('balance', 0)
     sub_end = user_info.get('subscription_end_date')
@@ -607,27 +615,21 @@ async def show_subscription_menu(update: Update, context: ContextTypes.DEFAULT_T
         f"💰 Пополнить баланс можно через @suplira (укажите ваш Telegram ID)\n"
         f"После пополнения выберите план:\n"
     )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
 
 async def handle_buy_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_id: int):
+    query = update.callback_query
     user_id = update.effective_user.id
     success = purchase_subscription(user_id, plan_id)
     if success:
-        await update.callback_query.answer("✅ Подписка оформлена!", show_alert=True)
+        await query.answer("✅ Подписка оформлена!", show_alert=True)
         await show_subscription_menu(update, context)
     else:
-        await update.callback_query.answer("❌ Недостаточно средств на балансе!", show_alert=True)
+        await query.answer("❌ Недостаточно средств на балансе!", show_alert=True)
 
 # --------------------- АДМИН-КОМАНДЫ ---------------------
 async def admin_add_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
