@@ -33,7 +33,8 @@ if not TELEGRAM_TOKEN:
 VIRUSTOTAL_API_KEY = os.getenv('VIRUSTOTAL_API_KEY', '')
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
-ADMIN_IDS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
+# ADMIN_IDS из env – fallback, если таблица admins пуста
+ENV_ADMIN_IDS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
 
 TINEYE_API_KEY = os.getenv('TINEYE_API_KEY', '')
 DADATA_API_KEY = os.getenv('DADATA_API_KEY', '')
@@ -141,7 +142,43 @@ def add_balance(telegram_id: int, amount: float) -> bool:
         logger.error(f"Ошибка add_balance: {e}")
         return False
 
-# --------------------- МОДУЛИ OSINT (существующие) ---------------------
+# --------------------- АДМИНИСТРИРОВАНИЕ (БД) ---------------------
+def is_admin(telegram_id: int) -> bool:
+    """Проверяет, является ли пользователь админом (сначала БД, потом env)"""
+    try:
+        result = supabase.rpc('is_admin', {'p_user_id': telegram_id}).execute()
+        if result.data:
+            return True
+    except Exception as e:
+        logger.error(f"Ошибка is_admin: {e}")
+    # fallback на ENV_ADMIN_IDS
+    return telegram_id in ENV_ADMIN_IDS
+
+def add_admin(telegram_id: int) -> bool:
+    try:
+        supabase.rpc('add_admin', {'p_user_id': telegram_id}).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка add_admin: {e}")
+        return False
+
+def remove_admin(telegram_id: int) -> bool:
+    try:
+        supabase.rpc('remove_admin', {'p_user_id': telegram_id}).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка remove_admin: {e}")
+        return False
+
+def get_all_admins() -> List[int]:
+    try:
+        resp = supabase.table('admins').select('telegram_id').execute()
+        return [row['telegram_id'] for row in resp.data]
+    except Exception as e:
+        logger.error(f"Ошибка get_all_admins: {e}")
+        return []
+
+# --------------------- МОДУЛИ OSINT ---------------------
 def run_blackbird(target: str, search_type: str = 'username') -> Optional[str]:
     if not os.path.exists(BLACKBIRD_PATH):
         return None
@@ -327,7 +364,7 @@ def check_hibp(email: str) -> Dict:
     except Exception as e:
         return {"error": str(e)}
 
-# --------------------- ФОРМИРОВАНИЕ ОТВЕТОВ ---------------------
+# --------------------- ФОРМАТИРОВАНИЕ ОТВЕТОВ (без "Вектор") ---------------------
 def format_search_result(search_type: str, target: str, raw_data: Dict, has_subscription: bool) -> str:
     fields = [
         "ДАТА РОЖДЕНИЯ",
@@ -340,7 +377,8 @@ def format_search_result(search_type: str, target: str, raw_data: Dict, has_subs
     found_status = "\n".join([f"{field}: Найдено" for field in fields])
     num_bases = random.randint(10, 50)
     num_records = random.randint(50, 300)
-    link = "Весна ссылка на Вектор инфо"
+    # Убираем упоминание "Вектор"
+    link = "Ссылка на полный отчёт"
     message = f"**Найденные данные:**\n\n{found_status}\n\n"
     message += f"Количество баз: {num_bases}\n"
     message += f"Количество записей: {num_records}\n\n"
@@ -405,10 +443,8 @@ def format_search_result(search_type: str, target: str, raw_data: Dict, has_subs
         message += "**Полная информация доступна по подписке**\n"
     return message
 
-# --------------------- ОБРАБОТЧИКИ БОТА ---------------------
-
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    """Показывает главное меню, может редактировать существующее сообщение"""
+# --------------------- ГЛАВНОЕ МЕНЮ ---------------------
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_target=None):
     user = update.effective_user
     ensure_user_exists(user.id, username=user.username, first_name=user.first_name)
     keyboard = [
@@ -422,19 +458,25 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
         [InlineKeyboardButton("💳 Подписка / Баланс", callback_data='subscription'),
          InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
-    text = (f"🤖 **OSINT-MAX Bot**\n\n"
+    text = (f"🤖 **LIRAMAX Bot**\n\n"
             f"Привет, {user.first_name}! Я помогаю находить информацию в открытых источниках.\n"
             f"У вас **3 бесплатных запроса**, затем нужна подписка.\n\n"
             f"Выберите действие:")
-    if edit:
-        await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    else:
+
+    if edit_target:
+        await edit_target.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    elif update.message:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        if update.callback_query:
+            await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            logger.warning("Не удалось отправить меню: нет ни message, ни callback_query")
 
-# Команда /start теперь вызывает show_main_menu с edit=False
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_main_menu(update, context, edit=False)
+    await show_main_menu(update, context)
 
+# --------------------- ОБРАБОТЧИКИ КНОПОК ---------------------
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -451,12 +493,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Поиск по фото – обратный поиск изображений.\n"
             "• Поиск по ИНН – информация об организации/ИП.\n"
             "• Проверка email на утечки – HIBP.\n\n"
-            "💰 У вас 3 бесплатных запроса. Для продолжения оформите подписку.",
+            "💰 У вас 3 бесплатных запроса. Для продолжения оформите подписку.\n\n"
+            "👑 Админы могут использовать команды:\n"
+            "/admin – список админов\n"
+            "/set_admin <id> – добавить/удалить админа",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад в меню", callback_data='back_to_main')]])
         )
     elif data == 'back_to_main':
-        await show_main_menu(update, context, edit=True)
+        await show_main_menu(update, context, edit_target=query.message)
     elif data == 'subscription':
         await show_subscription_menu(update, context)
     elif data.startswith('buy_plan_'):
@@ -486,6 +531,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data='back_to_main')]])
         )
 
+# --------------------- ОБРАБОТКА ТЕКСТА И ФОТО ---------------------
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
@@ -496,6 +542,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Меню", callback_data='back_to_main')]])
         )
         return
+
     if not check_query_limit(user_id):
         await update.message.reply_text(
             "❌ **Ваш бесплатный дневной лимит запросов превышен.**\n\n"
@@ -508,9 +555,11 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['awaiting'] = None
         return
+
     user_info = get_user_info(user_id)
     has_sub = user_info and user_info.get('subscription_end_date') and datetime.fromisoformat(user_info['subscription_end_date'].replace('Z', '+00:00')) > datetime.now()
     result_message = ""
+
     if awaiting == 'search_username':
         result_file = run_blackbird(text, 'username')
         raw_data = parse_blackbird_results(result_file) if result_file else {}
@@ -540,6 +589,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_message = f"❌ Ошибка: {hibp_data['error']}"
         else:
             result_message = format_search_result('hibp', text, hibp_data, has_sub)
+
     context.user_data['awaiting'] = None
     await update.message.reply_text(
         result_message,
@@ -556,6 +606,7 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     awaiting = context.user_data.get('awaiting')
     if awaiting != 'search_photo':
         return
+
     if not check_query_limit(user_id):
         await update.message.reply_text(
             "❌ **Ваш бесплатный дневной лимит запросов превышен.**\n\n"
@@ -567,13 +618,16 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         context.user_data['awaiting'] = None
         return
+
     photo_file = await update.message.photo[-1].get_file()
     file_data = await photo_file.download_as_bytearray()
     filename = photo_file.file_path.split('/')[-1] or 'photo.jpg'
+
     user_info = get_user_info(user_id)
     has_sub = user_info and user_info.get('subscription_end_date') and datetime.fromisoformat(user_info['subscription_end_date'].replace('Z', '+00:00')) > datetime.now()
     photo_data = search_by_photo(file_data, filename)
     result_message = format_search_result('photo', filename, photo_data, has_sub)
+
     context.user_data['awaiting'] = None
     await update.message.reply_text(
         result_message,
@@ -585,19 +639,24 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ])
     )
 
+# --------------------- ПОДПИСКА ---------------------
 async def show_subscription_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
     user_id = update.effective_user.id
     user_info = get_user_info(user_id)
     if not user_info:
-        await query.edit_message_text("❌ Ошибка: пользователь не найден")
+        if update.callback_query:
+            await update.callback_query.edit_message_text("❌ Ошибка: пользователь не найден")
+        else:
+            await update.message.reply_text("❌ Ошибка: пользователь не найден")
         return
+
     balance = user_info.get('balance', 0)
     sub_end = user_info.get('subscription_end_date')
     if sub_end and datetime.fromisoformat(sub_end.replace('Z', '+00:00')) > datetime.now():
         sub_status = f"✅ Активна до {sub_end[:10]}"
     else:
         sub_status = "❌ Нет активной подписки"
+
     plans = get_subscription_plans()
     keyboard = []
     for plan in plans:
@@ -608,6 +667,7 @@ async def show_subscription_menu(update: Update, context: ContextTypes.DEFAULT_T
             )
         ])
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data='back_to_main')])
+
     text = (
         f"💳 **Подписка и баланс**\n\n"
         f"Ваш баланс: **{balance}₽**\n"
@@ -615,69 +675,97 @@ async def show_subscription_menu(update: Update, context: ContextTypes.DEFAULT_T
         f"💰 Пополнить баланс можно через @suplira (укажите ваш Telegram ID)\n"
         f"После пополнения выберите план:\n"
     )
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
 async def handle_buy_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_id: int):
-    query = update.callback_query
     user_id = update.effective_user.id
     success = purchase_subscription(user_id, plan_id)
     if success:
-        await query.answer("✅ Подписка оформлена!", show_alert=True)
+        await update.callback_query.answer("✅ Подписка оформлена!", show_alert=True)
         await show_subscription_menu(update, context)
     else:
-        await query.answer("❌ Недостаточно средств на балансе!", show_alert=True)
+        await update.callback_query.answer("❌ Недостаточно средств на балансе!", show_alert=True)
 
 # --------------------- АДМИН-КОМАНДЫ ---------------------
-async def admin_add_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список админов"""
     user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
-    if len(context.args) != 2:
-        await update.message.reply_text("Использование: `/add_balance 123456789 100`", parse_mode='Markdown')
+    admins = get_all_admins()
+    if not admins:
+        await update.message.reply_text("👑 Список админов пуст.")
+        return
+    text = "👑 **Список администраторов:**\n"
+    for uid in admins:
+        # пытаемся получить username из users
+        user_info = get_user_info(uid)
+        name = user_info.get('username') or user_info.get('first_name') or str(uid)
+        text += f"• {name} (`{uid}`)\n"
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def set_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет или удаляет админа. Использование: /set_admin <id>"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: `/set_admin 123456789`", parse_mode='Markdown')
         return
     try:
         target_id = int(context.args[0])
-        amount = float(context.args[1])
-        if add_balance(target_id, amount):
-            await update.message.reply_text(f"✅ Баланс пользователя {target_id} пополнен на {amount}₽")
-        else:
-            await update.message.reply_text("❌ Ошибка пополнения")
     except ValueError:
-        await update.message.reply_text("❌ Неверный формат суммы")
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Доступ запрещён.")
+        await update.message.reply_text("❌ Неверный ID. Укажите число.")
         return
-    try:
-        users_count = supabase.table('users').select('*', count='exact').execute().count
-        resp = supabase.table('users').select('balance').execute()
-        total_balance = sum(u['balance'] for u in resp.data)
-        await update.message.reply_text(
-            f"📊 **Статистика**\n\n"
-            f"👥 Пользователей: {users_count}\n"
-            f"💰 Общий баланс: {total_balance}₽",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    if target_id == user_id:
+        await update.message.reply_text("❌ Вы не можете удалить самого себя.")
+        return
+
+    # Проверяем, есть ли уже в админах
+    if is_admin(target_id):
+        # удаляем
+        if remove_admin(target_id):
+            await update.message.reply_text(f"✅ Пользователь `{target_id}` удалён из админов.", parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ Ошибка удаления.")
+    else:
+        # добавляем
+        if add_admin(target_id):
+            await update.message.reply_text(f"✅ Пользователь `{target_id}` добавлен в админы.", parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ Ошибка добавления.")
 
 # --------------------- ЗАПУСК ---------------------
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("set_admin", set_admin_command))
+
+    # Админ-команды для баланса и статистики (только для админов)
     app.add_handler(CommandHandler("add_balance", admin_add_balance))
     app.add_handler(CommandHandler("stats", admin_stats))
+
     app.add_handler(CallbackQueryHandler(button_callback, pattern='^(help|back_to_main|subscription|buy_plan_|search_)'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_input))
-    logger.info("🚀 Бот запущен!")
+
+    logger.info("🚀 Бот LIRAMAX запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
